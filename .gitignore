@@ -1,0 +1,12 @@
+/*
+!/.gitignore
+!/SilverGuard/
+/SilverGuard/Core/Inc/net_secret.h
+/SilverGuard/Drivers/CMSIS/DSP/
+/SilverGuard/Drivers/CMSIS/Lib/
+**/MDK-ARM/*/
+**/RTE/
+**/DebugConfig/
+*.uvguix.*
+*.bak
+*.log
