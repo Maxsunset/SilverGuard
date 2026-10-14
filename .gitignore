@@ -9,4 +9,6 @@
 **/DebugConfig/
 *.uvguix.*
 *.bak
+*.bak*
+*.scvd
 *.log
