@@ -57,8 +57,7 @@ typedef enum {/*led_mode_type*/
 
 typedef enum {/*warn_mode_type*/
 	warn_off,
-	warn_slow,
-	warn_fast,
+	warn_on,
 } warn_mode_type;
 
 typedef enum {/*buzz_mode_type*/
@@ -116,7 +115,7 @@ typedef struct {/*button_handle*/
 typedef struct {/*net_handle*/
 	uint8_t state;
 	uint8_t hit;
-	uint8_t pub_busy;
+	uint8_t stage;
 	uint8_t retry;
 	uint8_t head;
 	uint8_t tail;
@@ -126,6 +125,8 @@ typedef struct {/*net_handle*/
 	uint32_t tick;
 	const char *last;
 	const char *box[NET_Q];
+	uint8_t frame[64];
+	uint8_t frame_len;
 } net_handle;
 
 typedef struct {/*hardware_handle*/
@@ -140,6 +141,7 @@ typedef struct {/*hardware_handle*/
 /* USER CODE BEGIN PD */
 
 #define NET_TOPIC "SilverGuard_3Xu"
+#define MQTT_CLIENT "sg-module-01"
 #define BKP_PRE   0xA501
 #define BKP_ALARM 0xA502
 
@@ -215,6 +217,11 @@ static void voice_send(const uint8_t *text, uint16_t len);
 static void net_flush(void);
 static void net_send(const char *cmd);
 static uint8_t net_poll(const char *token);
+static uint8_t net_len(uint8_t *p, uint16_t v);
+static void net_frame_connect(void);
+static void net_frame_pub(const char *payload);
+static void net_raw_start(void);
+static uint8_t net_raw_task(void);
 static void net_start(uint8_t step);
 static void net_put(const char *msg);
 static void net_fail(void);
@@ -681,8 +688,8 @@ static void main_state_machine(void)
 			set_state(alarm_cancel);
 		break;
 	case alarm_cancel:
-		if (now - st.tick >= 10000)
-			set_state(standby);
+		if (now - st.tick >= 3000)
+			set_state((st.flag == 1) ? offline : standby);
 		break;
 	case offline:
 		if (bt.button == triggered)
@@ -726,11 +733,9 @@ static void detect_button(void)
 			break;
 	case pressed:
 		if (now - bt.tick >= 1000){
-			bt.button = triggered;
-		}
+			bt.button = triggered;}
 		else if (level == GPIO_PIN_SET){
-			bt.button = idle;
-		}
+			bt.button = idle;}
 		break;
 	case triggered:
 		bt.button = idle;
@@ -742,7 +747,6 @@ static void distribute(void)
 {
 	if (st.standby_enter){
 		st.standby_enter = 0;
-		on_board_light(led_on);
 		oled(scr_online);
 		warning_light(warn_off);
 		buzzer(buzz_off);
@@ -750,7 +754,6 @@ static void distribute(void)
 		ESP8266(net_online);}
 	if (st.checking_enter){
 		st.checking_enter = 0;
-		on_board_light(led_on);
 		oled(scr_checking);
 		warning_light(warn_off);
 		buzzer(buzz_off);
@@ -758,23 +761,20 @@ static void distribute(void)
 		ESP8266(net_none);}
 	if (st.pre_alarm_enter){
 		st.pre_alarm_enter = 0;
-		on_board_light(led_on);
 		oled(scr_prealarm);
-		warning_light(warn_slow);
+		warning_light(warn_on);
 		buzzer(buzz_off);
 		SYN6288(voice_prealarm);
 		ESP8266(net_none);}
 	if (st.alarm_enter){
 		st.alarm_enter = 0;
-		on_board_light(led_on);
 		oled(scr_alarm);
-		warning_light(warn_fast);
+		warning_light(warn_on);
 		buzzer(buzz_siren);
 		SYN6288(voice_alarm);
 		ESP8266(net_alarm);}
 	if (st.alarm_cancel_enter){
 		st.alarm_cancel_enter = 0;
-		on_board_light(led_on);
 		oled(scr_cancel);
 		warning_light(warn_off);
 		buzzer(buzz_off);
@@ -784,26 +784,40 @@ static void distribute(void)
 		st.offline_enter = 0;
 		memset(sg.windows, 0xFF, sizeof(sg.windows));
 		sg.output = 0xFF;
-		on_board_light(led_off);
 		oled(scr_offline);
 		warning_light(warn_off);
 		buzzer(buzz_off);
 		SYN6288(voice_none);
 		ESP8266(net_offline);}
+	on_board_light((st.state == offline || st.flag == 1) ? led_off : led_on);
 }
 
 /*实现层*/
 
 static void on_board_light(led_mode_type mode)
 {
+	static led_mode_type before = led_on;
+
+	if (mode == before)
+		return;
+	before = mode;
 	led_lighted(mode);
 }
 
 static void oled(screen_type screen)
 {
+	static uint8_t before_screen = 0xFF;
+	static uint8_t before_flag = 0xFF;
+	uint8_t flag = (st.flag == 1) ? 1 : 0;
+
+	if ((uint8_t)screen == before_screen && flag == before_flag)
+		return;
+	before_screen = (uint8_t)screen;
+	before_flag = flag;
+
 	ssd1306_clear(&hd.oled);
 
-	if (screen == scr_offline)
+	if (screen == scr_offline || st.flag == 1)
 		ssd1306_gram_write_string(&hd.oled, 0, 0, "offline", 7, 1, SSD1306_FONT_16);
 	else
 		ssd1306_gram_write_string(&hd.oled, 0, 0, "online", 6, 1, SSD1306_FONT_16);
@@ -1022,17 +1036,11 @@ static void modulate(void)
 {
 	static uint16_t last_arr = 0;
 	uint16_t arr;
-	uint16_t period;
 
 	if (hd.light_mode == warn_off)
 		light_lighted(led_off);
-	else {
-		period = (hd.light_mode == warn_slow) ? 500 : 150;
-		if ((now / period) % 2 == 0)
-			light_lighted(led_on);
-		else
-			light_lighted(led_off);
-	}
+	else
+		light_lighted(led_on);
 
 	if (hd.buzz_mode == buzz_off){
 		if (last_arr != 0){
@@ -1112,15 +1120,126 @@ static uint8_t net_poll(const char *token)
 	return 0;
 }
 
+static uint8_t net_len(uint8_t *p, uint16_t v)
+{
+	uint8_t n = 0;
+
+	do {
+		uint8_t b = (uint8_t)(v % 128);
+
+		v = (uint16_t)(v / 128);
+		if (v > 0)
+			b |= 0x80;
+		p[n] = b;
+		n++;
+	} while (v > 0);
+	return n;
+}
+
+static void net_frame_connect(void)
+{
+	uint8_t n = (uint8_t)strlen(MQTT_CLIENT);
+	uint8_t i = 0;
+
+	nt.frame[i] = 0x10;
+	i++;
+	i += net_len(&nt.frame[i], (uint16_t)(12 + n));
+	nt.frame[i] = 0x00; i++;
+	nt.frame[i] = 0x04; i++;
+	memcpy(&nt.frame[i], "MQTT", 4); i += 4;
+	nt.frame[i] = 0x04; i++;
+	nt.frame[i] = 0x02; i++;
+	nt.frame[i] = 0x00; i++;
+	nt.frame[i] = 60; i++;
+	nt.frame[i] = 0x00; i++;
+	nt.frame[i] = n; i++;
+	memcpy(&nt.frame[i], MQTT_CLIENT, n);
+	i += n;
+	nt.frame_len = i;
+}
+
+static void net_frame_pub(const char *payload)
+{
+	uint16_t topic_len = (uint16_t)strlen(NET_TOPIC);
+	uint16_t payload_len = (uint16_t)strlen(payload);
+	uint16_t rem = (uint16_t)(topic_len + payload_len + 2);
+	uint8_t i = 0;
+
+	nt.frame[i] = 0x30;
+	i++;
+	i += net_len(&nt.frame[i], rem);
+	nt.frame[i] = (uint8_t)(topic_len >> 8); i++;
+	nt.frame[i] = (uint8_t)(topic_len & 0xFF); i++;
+	memcpy(&nt.frame[i], NET_TOPIC, topic_len);
+	i += (uint8_t)topic_len;
+	memcpy(&nt.frame[i], payload, payload_len);
+	i += (uint8_t)payload_len;
+	nt.frame_len = i;
+}
+
+static void net_raw_start(void)
+{
+	char cmd[16];
+	uint8_t v = nt.frame_len;
+	uint8_t i = 0;
+
+	memcpy(cmd, "AT+CIPSEND=", 11);
+	i = 11;
+	if (v >= 10){
+		cmd[i] = (char)('0' + v / 10);
+		i++;
+		v = (uint8_t)(v % 10);}
+	cmd[i] = (char)('0' + v);
+	i++;
+	cmd[i] = 0;
+
+	net_flush();
+	nt.hit = 0;
+	net_send(cmd);
+	nt.tick = now;
+	nt.stage = 1;
+}
+
+static uint8_t net_raw_task(void)
+{
+	if (nt.stage == 1){
+		if (net_poll(">")){
+			HAL_UART_Transmit(&huart1, nt.frame, nt.frame_len, 100);
+			nt.hit = 0;
+			nt.tick = now;
+			nt.stage = 2;
+			return 0;
+		}
+		if (now - nt.tick > 1000){
+			nt.stage = 0;
+			net_fail();
+			return 2;}
+		return 0;
+	}
+
+	if (nt.stage == 2){
+		if (net_poll("SEND OK")){
+			nt.stage = 0;
+			nt.tick = now;
+			return 1;
+		}
+		if (now - nt.tick > 2000){
+			nt.stage = 0;
+			net_fail();
+			return 2;}
+	}
+	return 0;
+}
+
 static void net_start(uint8_t step)
 {
 	static const char *const cmd[4] = {
 		"AT+CWMODE=1",
 		"AT+CWJAP=\"" NET_SSID "\",\"" NET_PASS "\"",
-		"AT+MQTTUSERCFG=0,1,\"sg-module-01\",\"\",\"\",0,0,\"\"",
-		"AT+MQTTCONN=0,\"broker.emqx.io\",1883,0",
+		"AT+CIPMUX=0",
+		"AT+CIPSTART=\"TCP\",\"broker.emqx.io\",1883",
 	};
-	static const uint32_t limit[4] = {1000, 20000, 2000, 8000};
+	static const uint32_t limit[4] = {1000, 20000, 1000, 8000};
 
 	net_flush();
 	nt.hit = 0;
@@ -1151,20 +1270,17 @@ static void net_fail(void)
 
 static void net_task(void)
 {
-	const char *cmd_head = "AT+MQTTPUB=0,\"" NET_TOPIC "\",\"";
-
 	if (nt.state == 0){
 		net_start(1);
 		return;
 	}
 
 	if (nt.state <= 4){
-		if (net_poll("OK")){
+		if (net_poll((nt.state == 4) ? "CONNECT" : "OK")){
 			if (nt.state == 4){
-				nt.retry = 0;
-				nt.state = 5;
-				if (nt.dirty != 0 && nt.last != 0)
-					net_put(nt.last);}
+				net_frame_connect();
+				net_raw_start();
+				nt.state = 7;}
 			else
 				net_start(nt.state + 1);
 			return;
@@ -1176,33 +1292,40 @@ static void net_task(void)
 
 	if (nt.state == 6){
 		if (now - nt.tick > nt.backoff)
-			nt.state = 0;
+			net_start((nt.retry >= 3) ? 1 : 3);
 		return;
 	}
 
-	if (nt.pub_busy == 0){
-		if (nt.head == nt.tail)
-			return;
-		net_flush();
-		nt.hit = 0;
-		HAL_UART_Transmit(&huart1, (uint8_t *)cmd_head, (uint16_t)strlen(cmd_head), 100);
-		HAL_UART_Transmit(&huart1, (uint8_t *)nt.box[nt.head], (uint16_t)strlen(nt.box[nt.head]), 100);
-		HAL_UART_Transmit(&huart1, (uint8_t *)"\",0,0\r\n", 7, 100);
+	if (nt.state == 7){
+		if (net_raw_task() == 1){
+			nt.retry = 0;
+			nt.state = 5;
+			if (nt.dirty != 0 && nt.last != 0)
+				net_put(nt.last);}
+		return;
+	}
+
+	if (nt.stage != 0){
+		if (net_raw_task() == 1)
+			nt.retry = 0;
+		return;
+	}
+
+	if (nt.head != nt.tail){
+		net_frame_pub(nt.box[nt.head]);
 		nt.head = (nt.head + 1) % NET_Q;
-		nt.tick = now;
-		nt.pub_busy = 1;
+		net_raw_start();
 		return;
 	}
 
-	if (net_poll("OK")){
-		nt.pub_busy = 0;
-		if (nt.head == nt.tail)
-			nt.dirty = 0;
-		return;
-	}
-	if (now - nt.tick > 1000){
-		nt.pub_busy = 0;
-		net_fail();}
+	if (nt.dirty != 0)
+		nt.dirty = 0;
+
+	if (now - nt.tick > 30000){
+		nt.frame[0] = 0xC0;
+		nt.frame[1] = 0x00;
+		nt.frame_len = 2;
+		net_raw_start();}
 }
 
 /*报警记忆（BKP）*/

@@ -51,7 +51,7 @@ extern I2C_HandleTypeDef hi2c1;
  * @brief 单次硬件 I2C 事务的超时时间，单位 ms
  * @note  屏幕未接或线松时，每次写会阻塞到这里超时返回，所以不要设得过大
  */
-#define SSD1306_IIC_TIMEOUT_MS      100U
+#define SSD1306_IIC_TIMEOUT_MS       10U
 
 /**
  * @brief 单个 I2C 事务中携带的数据字节数上限
@@ -187,14 +187,7 @@ void ssd1306_interface_delay_ms(uint32_t ms)
  */
 void ssd1306_interface_debug_print(const char *const fmt, ...)
 {
-    char buffer[128];
-    va_list args;
-
-    va_start(args, fmt);
-    (void)vsnprintf(buffer, sizeof(buffer), fmt, args);
-    va_end(args);
-
-    printf("%s", buffer);
+    (void)fmt;
 }
 
 /**
