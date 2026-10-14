@@ -33,6 +33,12 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 #define NET_Q 8
+#define NET_RXQ 512
+
+static volatile uint8_t net_rx[NET_RXQ];
+static volatile uint16_t net_rx_head;
+static volatile uint16_t net_rx_tail;
+static uint8_t net_rx8;
 
 typedef enum {/*state_type*/
 	offline,
@@ -279,6 +285,7 @@ int main(void)
   init();
   oled_init();
   HAL_UART_Receive_IT(&huart2, &sg.windows[0], 1);
+  HAL_UART_Receive_IT(&huart1, &net_rx8, 1);
   HAL_TIM_Base_Start_IT(&htim2);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
   /* USER CODE END 2 */
@@ -907,8 +914,8 @@ static void ESP8266(net_type net)
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-	sg.flag = 1;
 	if (huart->Instance == USART2){
+		sg.flag = 1;
 		sg.output = analyze_data(sg.windows, 5);
 		uint8_t i;
 		for(i = 4; i > 0; i--){
@@ -916,6 +923,32 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 		sg.windows[0] = 0xFF;
 		HAL_UART_Receive_IT(&huart2, &sg.windows[0], 1);
 		}
+	else if (huart->Instance == USART1){
+		uint16_t next = (uint16_t)((net_rx_head + 1) % NET_RXQ);
+		if (next != net_rx_tail){
+			net_rx[net_rx_head] = net_rx8;
+			net_rx_head = next;
+		}
+		HAL_UART_Receive_IT(&huart1, &net_rx8, 1);
+		}
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+	if (huart->Instance == USART1){
+		__HAL_UART_CLEAR_OREFLAG(huart);
+		__HAL_UART_CLEAR_FEFLAG(huart);
+		__HAL_UART_CLEAR_NEFLAG(huart);
+		__HAL_UART_CLEAR_PEFLAG(huart);
+		HAL_UART_Receive_IT(&huart1, &net_rx8, 1);
+	}
+	else if (huart->Instance == USART2){
+		__HAL_UART_CLEAR_OREFLAG(huart);
+		__HAL_UART_CLEAR_FEFLAG(huart);
+		__HAL_UART_CLEAR_NEFLAG(huart);
+		__HAL_UART_CLEAR_PEFLAG(huart);
+		HAL_UART_Receive_IT(&huart2, &sg.windows[0], 1);
+	}
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
@@ -1088,10 +1121,7 @@ static void voice_send(const uint8_t *text, uint16_t len)
 
 static void net_flush(void)
 {
-	uint8_t c;
-
-	while (HAL_UART_Receive(&huart1, &c, 1, 0) == HAL_OK){
-	}
+	net_rx_tail = net_rx_head;
 }
 
 static void net_send(const char *cmd)
@@ -1105,7 +1135,9 @@ static uint8_t net_poll(const char *token)
 	uint8_t c;
 	uint8_t len = (uint8_t)strlen(token);
 
-	while (HAL_UART_Receive(&huart1, &c, 1, 0) == HAL_OK){
+	while (net_rx_tail != net_rx_head){
+		c = net_rx[net_rx_tail];
+		net_rx_tail = (uint16_t)((net_rx_tail + 1) % NET_RXQ);
 		if (c == token[nt.hit]){
 			nt.hit++;
 			if (nt.hit >= len){
