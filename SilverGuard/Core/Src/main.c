@@ -104,6 +104,7 @@ typedef struct {/*state_handle*/
 	bool pre_alarm_enter;
 	bool alarm_enter;
 	bool alarm_cancel_enter;
+	bool cancel_silent;
 	bool offline_enter;
 } state_handle;
 
@@ -500,7 +501,7 @@ static void MX_TIM3_Init(void)
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
+  sConfigOC.Pulse = 333;
   sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
@@ -685,18 +686,25 @@ static void main_state_machine(void)
 			set_state(pre_alarm);
 		break;
 	case pre_alarm:
-		if (bt.button == triggered)
-			set_state(alarm_cancel);
+		if (bt.button == triggered){
+			st.cancel_silent = 1;
+			set_state(alarm_cancel);}
 		else if (now - st.tick >= 10000)
 			set_state(alarm);
 		break;
 	case alarm:
-		if (bt.button == triggered)
-			set_state(alarm_cancel);
+		if (bt.button == triggered){
+			st.cancel_silent = 0;
+			set_state(alarm_cancel);}
 		break;
 	case alarm_cancel:
-		if (now - st.tick >= 3000)
-			set_state((st.flag == 1) ? offline : standby);
+		if (now - st.tick >= 3000){
+			if (st.flag == 1)
+				set_state(offline);
+			else if (sg.output == 1)
+				set_state(checking);
+			else
+				set_state(standby);}
 		break;
 	case offline:
 		if (bt.button == triggered)
@@ -765,7 +773,7 @@ static void distribute(void)
 		warning_light(warn_off);
 		buzzer(buzz_off);
 		SYN6288(voice_none);
-		ESP8266(net_none);}
+		ESP8266(net_online);}
 	if (st.pre_alarm_enter){
 		st.pre_alarm_enter = 0;
 		oled(scr_prealarm);
@@ -786,7 +794,8 @@ static void distribute(void)
 		warning_light(warn_off);
 		buzzer(buzz_off);
 		SYN6288(voice_cancel);
-		ESP8266(net_cancel);}
+		if (st.cancel_silent == 0)
+			ESP8266(net_cancel);}
 	if (st.offline_enter){
 		st.offline_enter = 0;
 		memset(sg.windows, 0xFF, sizeof(sg.windows));
@@ -861,8 +870,9 @@ static void warning_light(warn_mode_type mode)
 static void buzzer(buzz_mode_type mode)
 {
 	hd.buzz_mode = mode;
-	if (mode == buzz_off)
-		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
+	if (mode == buzz_off){
+		__HAL_TIM_SET_AUTORELOAD(&htim3, 332);
+		__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 333);}
 }
 
 static void SYN6288(voice_type voice)
@@ -894,16 +904,16 @@ static void ESP8266(net_type net)
 		msg = "online";
 		break;
 	case net_alarm:
-		msg = "alarm";
+		msg = "1";
 		break;
 	case net_cancel:
-		msg = "cancel";
+		msg = "0";
 		break;
 	default:
 		return;
 	}
 
-	if (msg == nt.last && nt.dirty == 0)
+	if (msg == nt.last)
 		return;
 
 	nt.last = msg;
@@ -1078,7 +1088,8 @@ static void modulate(void)
 	if (hd.buzz_mode == buzz_off){
 		if (last_arr != 0){
 			last_arr = 0;
-			__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);}
+			__HAL_TIM_SET_AUTORELOAD(&htim3, 332);
+			__HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 333);}
 		return;
 	}
 
@@ -1331,9 +1342,7 @@ static void net_task(void)
 	if (nt.state == 7){
 		if (net_raw_task() == 1){
 			nt.retry = 0;
-			nt.state = 5;
-			if (nt.dirty != 0 && nt.last != 0)
-				net_put(nt.last);}
+			nt.state = 5;}
 		return;
 	}
 
